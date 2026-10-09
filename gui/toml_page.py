@@ -271,9 +271,16 @@ class TomlPage(QWidget):
 
     def _copy_in(self, path):
         destination = TOML_DIR / path.name
-        if destination.exists() and QMessageBox.question(
-                self, "Overwrite", f"Overwrite {path.name}?",
-                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+        if destination.exists():
+            if destination.resolve() == path.resolve():
+                return False  # dropped from the TOML folder itself
+            if QMessageBox.question(
+                    self, "Overwrite", f"Overwrite {path.name}?",
+                    QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+                return False
+        try:
+            shutil.copy2(path, destination)
+        except OSError as exc:
+            QMessageBox.warning(self, "Import failed", f"{path.name}: {exc}")
             return False
-        shutil.copy2(path, destination)
         return True

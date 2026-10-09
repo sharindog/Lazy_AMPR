@@ -44,6 +44,7 @@ class BuildDiagnostics:
     def hash_tree(self, root, filename):
         hashes = {}
         files = sorted(p for p in root.rglob('*') if p.is_file())
+        last_percent = -1
         with (self.path / filename).open('w', encoding='utf-8', newline='\n') as result:
             for number, path in enumerate(files, 1):
                 relative = path.relative_to(root).as_posix()
@@ -51,7 +52,11 @@ class BuildDiagnostics:
                 hashes[relative] = value
                 # JSON escaping preserves filenames containing newlines.
                 result.write(f'{value}  {json.dumps(relative, ensure_ascii=False)}\n')
-                self.report(f'[HASH] {filename}: {number}/{len(files)} files: {relative}')
+                # One line per percent keeps large games from flooding the log.
+                percent = number * 100 // len(files)
+                if percent != last_percent:
+                    last_percent = percent
+                    self.report(f'[HASH] {filename}: {number}/{len(files)} files: {relative}')
         return hashes
 
     def tool(self, *args):

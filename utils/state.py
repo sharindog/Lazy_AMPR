@@ -10,6 +10,9 @@ DATA_DIR = get_app_data_dir()
 TOML_DIR = DATA_DIR / "toml_profiles"
 STATE_FILE = DATA_DIR / "state.json"
 
+# Shortest normalized name that may match a TOML by substring.
+MIN_PARTIAL_TOML_MATCH = 5
+
 SETTINGS_VERSION = 3   # bump this whenever the saved settings schema changes
 
 DEFAULT_SETTINGS = {
@@ -126,33 +129,36 @@ class State:
     def get_game(self, path): return self.games.get(str(path))
     def tomls(self): return sorted(TOML_DIR.glob("*.toml"))
     def auto_toml_for(self, title_id, title, content_id=""):
-        """Match TOML files to games using flexible name matching."""
-        # Normalize all inputs: remove separators and lowercase
+        """Match TOML files to games using flexible name matching.
+
+        An exact match on the title ID, title or content ID wins. Otherwise a
+        TOML whose name contains (or is contained in) one of them is used,
+        preferring the most specific name. Placeholders and very short names
+        are never matched by substring, so "Bot" does not pick astrobot.toml.
+        """
         def normalize(s):
             if not s:
                 return ""
             return re.sub(r"[^a-z0-9]", "", str(s).lower())
-        
-        # Build normalized keys from game metadata
-        keys = [normalize(title_id), normalize(title), normalize(content_id)]
-        keys = [k for k in keys if k]  # Remove empty strings
-        
-        # Also create a version without underscores for exact matches
-        keys.extend([k.replace("_", "") for k in keys])
-        
+
+        keys = {normalize(k) for k in (title_id, title, content_id)}
+        keys -= {"", "unknown"}
+        if not keys:
+            return None
+
+        partial = []
         for t in self.tomls():
             stem = normalize(t.stem)
             if not stem:
                 continue
-            
-            # Check if TOML name matches any game key
+            if stem in keys:
+                return t.name
             for k in keys:
-                if not k:
-                    continue
-                # Match if: exact match, TOML contains game name, or game name contains TOML
-                if stem == k or stem in k or k in stem:
-                    return t.name
-        
+                if min(len(stem), len(k)) >= MIN_PARTIAL_TOML_MATCH and (stem in k or k in stem):
+                    partial.append((len(stem), t.name))
+                    break
+        if partial:
+            return max(partial)[1]
         return None
     def games_using(self, toml_name):
         return [e for e in self.games.values() if e.get("toml") == toml_name]

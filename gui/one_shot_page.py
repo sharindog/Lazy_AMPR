@@ -57,6 +57,7 @@ class OneShotPage(QWidget):
         self.input_path = None
         self.mounted_image = None
         self._loaded = False
+        self._running = False
         self._pct = 0
         self._eta = ""
         self._init_ui()
@@ -317,6 +318,10 @@ class OneShotPage(QWidget):
 
     def load_input(self, path: Path) -> bool:
         """Load a game folder or exFAT image selected by either drop target."""
+        if self._running:
+            # Switching now would retarget Cancel and could unmount the
+            # image that is still being packed.
+            return False
         path = normalize_path(str(path))
         if path.is_file() and is_exfat_image(path):
             return self._handle_exfat_image(path)
@@ -388,6 +393,8 @@ class OneShotPage(QWidget):
 
     # ------------------------------------------------------------ public API
     def browse(self):
+        if self._running:
+            return
         if not supports_image_mounting():
             # Image mounting is Windows-only (OSFMount); a folder is the only choice.
             self._browse_folder()
@@ -426,7 +433,19 @@ class OneShotPage(QWidget):
         if p:
             self.load_input(Path(p))
 
+    def _reset_game_options(self):
+        """Forget the previous game's TOML, traces and icon."""
+        self.custom_config_path = None
+        self.traces_dir = None
+        self.toml_name = None
+        self.toml_auto = False
+        self.traces_lbl.setText("No trace profile — blind packing will be used")
+        self.traces_lbl.setToolTip("")
+        self.cfg_lbl.setText("Auto-detect from Toml list")
+        self.icon_label.clear()
+
     def set_folder(self, path: Path):
+        self._reset_game_options()
         self.game_dir = path
         info = parse_game_info(path)
         self.game_info = info
@@ -507,6 +526,7 @@ class OneShotPage(QWidget):
         self._restyle()
 
     def set_running_state(self, running):
+        self._running = running
         self.start_btn.setEnabled(not running)
         self.start_btn.set_icon("clock" if running else "play")
         self.start_btn.setText("Processing…" if running else "Start processing")

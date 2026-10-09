@@ -95,7 +95,7 @@ class ReleaseCandidatePackTests(unittest.TestCase):
         extracted = self.root / f"extracted-{label}"
         outcomes = []
         worker = ExtractWorker(packed, extracted)
-        worker.finished.connect(lambda ok, message: outcomes.append((ok, message)))
+        worker.extraction_finished.connect(lambda ok, message: outcomes.append((ok, message)))
         worker.run()
         self.assertTrue(outcomes and outcomes[-1][0], outcomes[-1][1] if outcomes else "no result")
         self.assertEqual(_tree_snapshot(self.source), _tree_snapshot(extracted))
