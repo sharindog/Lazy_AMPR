@@ -62,7 +62,7 @@ class PackRoundTripTests(unittest.TestCase):
         extracted = self.root / "extracted"
         outcomes = []
         worker = ExtractWorker(packed, extracted)
-        worker.finished.connect(lambda ok, message: outcomes.append((ok, message)))
+        worker.extraction_finished.connect(lambda ok, message: outcomes.append((ok, message)))
         worker.run()
 
         self.assertTrue(outcomes and outcomes[-1][0], outcomes[-1][1] if outcomes else "no result")

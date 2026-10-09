@@ -601,6 +601,51 @@ def generate_trace_profile(traces_dir: Path, output_toml: Path, game_name: str,
             progress_callback(f"[OK] Generated metrics: {metrics_path.name}")
 
 
+def parse_pack_result(lines: list[str]) -> dict | None:
+    """Return the JSON object ``ampr_pack pack`` prints after its progress lines.
+
+    Progress goes to stderr and is merged into the same stream, so the result
+    is located by the line that opens it: progress lines never start with a
+    brace, and braces inside file names (quoted strings) are harmless.
+    """
+    decoder = json.JSONDecoder()
+    for start, line in enumerate(lines):
+        if not line.startswith("{"):
+            continue
+        try:
+            value, _ = decoder.raw_decode("\n".join(lines[start:]))
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def loose_paths_from_listing(lines: list[str]) -> set[str]:
+    """Loose relative paths from ``ampr_pack list --json`` output."""
+    rows = json.loads("\n".join(lines))
+    if not isinstance(rows, list):
+        raise TypeError("unexpected pack listing")
+    return {
+        str(row["path"]).removeprefix("/app0/")
+        for row in rows
+        if isinstance(row, dict) and not row.get("packed")
+    }
+
+
+def _same_file_contents(src_stat: os.stat_result, dst: Path) -> bool:
+    """True when *dst* is the same file or a preserved copy of it (copy2)."""
+    try:
+        dst_stat = dst.stat()
+    except OSError:
+        return False
+    if (src_stat.st_dev, src_stat.st_ino) == (dst_stat.st_dev, dst_stat.st_ino) and src_stat.st_ino:
+        return True
+    # FAT-family output volumes store modification times with 2 s precision.
+    return (dst_stat.st_size == src_stat.st_size
+            and abs(dst_stat.st_mtime - src_stat.st_mtime) <= 2)
+
+
 def run_lz4_pack(source_dir, output_dir, settings, custom_config=None,
                  traces_dir=None, game_name: str = "game",
                  lz4_level: int | None = None,
@@ -644,33 +689,18 @@ def run_lz4_pack(source_dir, output_dir, settings, custom_config=None,
     runtime_overrides = install_ampr_runtime(source_dir, output_dir)
 
     # 1. Get AMPR index describing the SOURCE tree, store in output.
+    # Always describe the current source: an index left in the output by an
+    # earlier run may predate changes to the game folder. The source tree is
+    # never written, whether or not it is a read-only mount.
     ampr_index = output_dir / "ampr_emu.index"
-    from core.ampr_index import _build_index_local, ensure_ampr_index
+    from core.ampr_index import _build_index_local
 
     source_index = source_dir / "ampr_emu.index"
-    fakelib_marker = source_dir / "fakelib" / "libSceAmpr.sprx"
-    regenerated_source_index = (
-        None if runtime_overrides or (source_read_only and fakelib_marker.is_file())
-        else ensure_ampr_index(source_dir)
-    )
     if runtime_overrides:
         _build_index_local(source_dir, ampr_index, metadata_overrides=runtime_overrides)
         if progress_callback:
             progress_callback('[INFO] Installed pinned AMPR fakelib in output; rebuilt index with its metadata. Source unchanged.')
-    elif regenerated_source_index is not None:
-        if progress_callback:
-            progress_callback(
-                "[INFO] Detected fakelib/libSceAmpr.sprx; regenerated source ampr_emu.index."
-            )
-        shutil.copy2(regenerated_source_index, ampr_index)
-    elif source_read_only and fakelib_marker.is_file():
-        if progress_callback:
-            progress_callback(
-                "[INFO] Detected fakelib/libSceAmpr.sprx on read-only mounted source; "
-                "rebuilt output ampr_emu.index."
-            )
-        _build_index_local(source_dir, ampr_index)
-    elif not ampr_index.exists():
+    else:
         reused = False
         if reuse_source_index and source_index.is_file() and source_index.stat().st_size > 0:
             if progress_callback:
@@ -693,7 +723,10 @@ def run_lz4_pack(source_dir, output_dir, settings, custom_config=None,
 
     # 2. Resolve profile: custom > traces > blind (scanned + learned)
     safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", game_name)[:50]
-    
+    if custom_config and not custom_config.exists() and progress_callback:
+        progress_callback(f"[WARN] Selected config {custom_config} no longer exists; "
+                          "using traces or a generated profile instead.")
+
     if custom_config and custom_config.exists():
         base_config_path = custom_config
         if progress_callback:
@@ -758,7 +791,10 @@ def run_lz4_pack(source_dir, output_dir, settings, custom_config=None,
 
     pack_stdout = []
 
-    def run_subprocess(cmd, stage):
+    def run_subprocess(cmd, stage, echo_json=True):
+        """Stream a helper's merged output; return all non-empty lines."""
+        output_lines = []
+        in_json = False
         check_cancelled()
         with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               text=True, encoding="utf-8", errors="replace",
@@ -773,6 +809,12 @@ def run_lz4_pack(source_dir, output_dir, settings, custom_config=None,
                     line = line.strip()
                     if not line:
                         continue
+                    output_lines.append(line)
+                    # The final JSON result can list every loose path; keep it
+                    # out of the UI log unless the caller wants it echoed.
+                    in_json = in_json or line.startswith("{")
+                    if in_json and not echo_json:
+                        continue
                     pack_stdout.append(line)
                     if progress_callback:
                         progress_callback(line)
@@ -786,62 +828,13 @@ def run_lz4_pack(source_dir, output_dir, settings, custom_config=None,
                 if cancel_check and cancel_check():
                     raise RuntimeError("Cancelled by user.")
                 if proc.returncode != 0:
-                    raise RuntimeError(f"{stage} failed with return code {proc.returncode}")
+                    detail = f": {output_lines[-1]}" if output_lines else ""
+                    raise RuntimeError(
+                        f"{stage} failed with return code {proc.returncode}{detail}")
             finally:
                 if process_callback:
                     process_callback(None)
-
-    def run_pack_subprocess(cmd):
-        output_lines = []
-        check_cancelled()
-        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              text=True, encoding="utf-8", errors="replace",
-                              cwd=str(TOOL_CWD),
-                              **hidden_child_process_kwargs()) as proc:
-            if process_callback:
-                process_callback(proc)
-            try:
-                if proc.stdout is None:
-                    raise RuntimeError("Pack process did not expose an output stream")
-                for line in proc.stdout:
-                    line_stripped = line.strip()
-                    if not line_stripped:
-                        continue
-                    output_lines.append(line_stripped)
-                    pack_stdout.append(line_stripped)
-                    if progress_callback:
-                        progress_callback(line_stripped)
-                    m = PROGRESS_RE.search(line_stripped)
-                    if m and progress_fraction:
-                        progress_fraction(int(m.group(2)) / 100.0, m.group(1))
-                    elapsed = ELAPSED_RE.search(line_stripped)
-                    if elapsed and eta_callback:
-                        eta_callback(f"Elapsed {elapsed.group(1)}")
-                proc.wait()
-                if cancel_check and cancel_check():
-                    raise RuntimeError("Cancelled by user.")
-                if proc.returncode != 0:
-                    raise RuntimeError(f"Pack failed with return code {proc.returncode}")
-            finally:
-                if process_callback:
-                    process_callback(None)
-        
-        full_output = "\n".join(output_lines)
-        try:
-            return json.loads(full_output.strip())
-        except (json.JSONDecodeError, ValueError):
-            start = full_output.rfind('{')
-            end = full_output.rfind('}')
-            if start != -1 and end != -1 and end > start:
-                try:
-                    return json.loads(full_output[start:end+1])
-                except (json.JSONDecodeError, ValueError):
-                    pass
-            
-            if progress_callback:
-                progress_callback("[WARN] Couldn't parse pack JSON output; "
-                                  "falling back to SAFETY_EXCLUSIONS-based copy.")
-            return None
+        return output_lines
 
     pack_command = [
         *command_for(TOOLS_DIR / "ampr_pack.py"),
@@ -853,7 +846,10 @@ def run_lz4_pack(source_dir, output_dir, settings, custom_config=None,
     ]
     for pattern in SAFETY_EXCLUSIONS:
         pack_command.extend(("--exclude", pattern))
-    pack_result = run_pack_subprocess(pack_command)
+    pack_result = parse_pack_result(run_subprocess(pack_command, "Pack", echo_json=False))
+    if pack_result is None and progress_callback:
+        progress_callback("[WARN] Couldn't parse pack JSON output; "
+                          "reading loose paths from the pack index instead.")
 
     # 4. Verify
     check_cancelled()
@@ -882,7 +878,21 @@ def run_lz4_pack(source_dir, output_dir, settings, custom_config=None,
         if progress_callback:
             progress_callback(f"[INFO] Using pack's own loose_paths list "
                               f"({len(loose_paths)} files) as source of truth.")
-    elif progress_callback:
+    elif assets_index.exists():
+        try:
+            listing = run_subprocess([*command_for(TOOLS_DIR / "ampr_pack.py"), "list",
+                                      "--index", str(assets_index), "--json"],
+                                     "List", echo_json=False)
+            loose_paths = loose_paths_from_listing(listing)
+        except (RuntimeError, OSError, ValueError, TypeError) as error:
+            if str(error) == "Cancelled by user.":
+                raise
+            if progress_callback:
+                progress_callback(f"[WARN] Couldn't list the pack index ({error}).")
+        if loose_paths is not None and progress_callback:
+            progress_callback(f"[INFO] Using the pack index's loose file list "
+                              f"({len(loose_paths)} files) as source of truth.")
+    if loose_paths is None and progress_callback:
         progress_callback("[WARN] No loose_paths available from pack output - "
                           "falling back to SAFETY_EXCLUSIONS matching only.")
 
@@ -890,6 +900,11 @@ def run_lz4_pack(source_dir, output_dir, settings, custom_config=None,
         if loose_paths is not None:
             return rel.as_posix() in loose_paths
         return is_loose_path(rel)
+
+    # Files this run already placed in the output must never be replaced by
+    # their source counterparts (the pinned runtime, the regenerated index).
+    protected = {name.casefold() for name in runtime_overrides}
+    protected.add("ampr_emu.index")
 
     copied, linked, skipped = 0, 0, 0
     total_bytes = 0
@@ -904,13 +919,19 @@ def run_lz4_pack(source_dir, output_dir, settings, custom_config=None,
                 continue
 
             dst = output_dir / rel
+            src_stat = src.stat()
 
             if dst.exists():
-                skipped += 1
-                continue
+                # A file left by an interrupted or earlier run is only kept
+                # when it still matches the source; otherwise it is replaced.
+                if rel.as_posix().casefold() in protected or _same_file_contents(src_stat, dst):
+                    skipped += 1
+                    continue
+                # Unlink first so a stale hardlink never writes through.
+                dst.unlink()
 
             dst.parent.mkdir(parents=True, exist_ok=True)
-            sz = src.stat().st_size
+            sz = src_stat.st_size
             if settings.get("use_hardlinks", False):
                 try:
                     os.link(src, dst)
@@ -939,8 +960,12 @@ def run_lz4_pack(source_dir, output_dir, settings, custom_config=None,
     if progress_fraction:
         progress_fraction(1.0, "loose")
 
-    for w in [l for l in pack_stdout if "auto-loose" in l.lower() or "[WARN]" in l]:
-        if progress_callback:
+    pack_warnings = pack_result.get("warnings") if pack_result else None
+    summary = [l for l in pack_stdout if "auto-loose" in l.lower() or "[WARN]" in l]
+    if isinstance(pack_warnings, list):
+        summary.extend(str(w) for w in pack_warnings)
+    if progress_callback:
+        for w in summary:
             progress_callback(f"[INFO] {w}")
 
     if progress_fraction:

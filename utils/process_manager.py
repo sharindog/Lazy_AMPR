@@ -136,7 +136,11 @@ class ProfileWorker(QThread):
 
     def run(self):
         try:
-            name = f"{self.title_id or slug(self.game_name)}.toml"
+            # parse_game_info reports a missing title ID as "Unknown"; naming
+            # every such profile Unknown.toml would overwrite one game's
+            # profile with another's.
+            title_id = self.title_id if self.title_id not in ("", "Unknown") else ""
+            name = f"{title_id or slug(self.game_name) or 'game'}.toml"
             generate_trace_profile(self.traces_dir, self.toml_dir / name, self.game_name)
             self.profile_finished.emit(True, name, f"Auto-generated {name} from traces")
         except Exception as e:  # noqa: BLE001 - worker boundary reports message to UI
@@ -163,7 +167,9 @@ class ExtractWorker(QThread):
     progress_updated = Signal(int)
     status_updated = Signal(str)
     log_updated = Signal(str)
-    finished = Signal(bool, str)
+    # Not named "finished": that would shadow QThread.finished, which must
+    # only fire once the thread has really stopped (deleteLater relies on it).
+    extraction_finished = Signal(bool, str)
 
     def __init__(self, source_dir, output_dir, parent=None):
         super().__init__(parent)
@@ -190,38 +196,29 @@ class ExtractWorker(QThread):
 
             # 1) Unpack the .pak volumes (0–70%)
             self.status_updated.emit("Extracting packed assets…")
-            cmd_variants = [
-                [*command_for(TOOLS_DIR / "ampr_pack.py"), "unpack",
-                 "--index", str(idx), "--output", str(self.output_dir)],
-                [*command_for(TOOLS_DIR / "ampr_pack.py"), "unpack",
-                 "--index", str(idx), "--out", str(self.output_dir)],
-            ]
-            last_err = ""
-            ok = False
-            for cmd in cmd_variants:
-                with subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                      stderr=subprocess.STDOUT, text=True,
-                                      encoding="utf-8", errors="replace",
-                                      cwd=str(TOOL_CWD),
-                                      **hidden_child_process_kwargs()) as proc:
-                    if proc.stdout is None:
-                        raise RuntimeError("Unpack process did not expose an output stream")
-                    for line in proc.stdout:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        self.log_updated.emit(line)
-                        m = prog_re.search(line)
-                        if m:
-                            self.progress_updated.emit(int(int(m.group(2)) * 0.7))
-                    proc.wait()
-                    if proc.returncode == 0:
-                        ok = True
-                        break
-                    last_err = f"return code {proc.returncode}"
-            if not ok:
-                raise RuntimeError(f"ampr_pack unpack failed ({last_err}). "
-                                   f"Check the log for the CLI usage error.")
+            cmd = [*command_for(TOOLS_DIR / "ampr_pack.py"), "unpack",
+                   "--index", str(idx), "--output", str(self.output_dir)]
+            last_line = ""
+            with subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True,
+                                  encoding="utf-8", errors="replace",
+                                  cwd=str(TOOL_CWD),
+                                  **hidden_child_process_kwargs()) as proc:
+                if proc.stdout is None:
+                    raise RuntimeError("Unpack process did not expose an output stream")
+                for line in proc.stdout:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    last_line = line
+                    self.log_updated.emit(line)
+                    m = prog_re.search(line)
+                    if m:
+                        self.progress_updated.emit(int(int(m.group(2)) * 0.7))
+                proc.wait()
+            if proc.returncode != 0:
+                raise RuntimeError(f"ampr_pack unpack failed (return code {proc.returncode})"
+                                   + (f": {last_line}" if last_line else ""))
 
             # 2) Rebuild the original tree: copy loose (non-packed) files (70–100%)
             self.status_updated.emit("Copying loose files…")
@@ -244,7 +241,7 @@ class ExtractWorker(QThread):
                 self.progress_updated.emit(70 + int(i / max(1, len(files)) * 30))
 
             self.progress_updated.emit(100)
-            self.finished.emit(True, f"Extraction completed: {self.output_dir}")
+            self.extraction_finished.emit(True, f"Extraction completed: {self.output_dir}")
         except Exception:  # noqa: BLE001 - worker boundary reports full traceback to UI
             import traceback
-            self.finished.emit(False, traceback.format_exc())
+            self.extraction_finished.emit(False, traceback.format_exc())

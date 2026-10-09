@@ -32,6 +32,8 @@ from utils.process_manager import ExtractWorker, GameWorker, ProfileWorker
 from utils.state import TOML_DIR, State
 from version import APP_NAME, VERSION
 
+CONSOLE_MAX_LINES = 20000
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -172,6 +174,8 @@ class MainWindow(QMainWindow):
         self.console = QPlainTextEdit()
         self.console.setObjectName("Console")
         self.console.setReadOnly(True)
+        # Older lines remain in the log file; keep the widget responsive.
+        self.console.setMaximumBlockCount(CONSOLE_MAX_LINES)
         self.console.setFixedHeight(150)
         self.console.setVisible(False)
         cl.addWidget(self.console)
@@ -292,10 +296,15 @@ class MainWindow(QMainWindow):
             content_id=info.get("content_id"),
         )
         if entry.get("toml_src") != "manual":
+            if card is not None and card.custom_config_path and not card.toml_auto:
+                # A config imported on the card itself wins over auto-linking.
+                return None
             name = entry.get("toml")
             if not (name and (TOML_DIR / name).exists()):
                 name = self.state.auto_toml_for(
-                    info.get("title_id", ""), info.get("title", "")
+                    info.get("title_id", ""),
+                    info.get("title", ""),
+                    info.get("content_id", ""),
                 )
             if name:
                 self.state.link_toml(path, name, "auto")
@@ -303,6 +312,10 @@ class MainWindow(QMainWindow):
                     card.custom_config_path = TOML_DIR / name
                     card.toml_name, card.toml_auto = name, True
                 return name
+            if card is not None and card.toml_auto:
+                # The auto-linked TOML was removed from the list.
+                card.custom_config_path = None
+                card.toml_name, card.toml_auto = None, False
         elif entry.get("toml"):
             if card is not None:
                 card.custom_config_path = TOML_DIR / entry["toml"]
@@ -471,7 +484,7 @@ class MainWindow(QMainWindow):
         w.progress_updated.connect(self.extract.set_progress)
         w.status_updated.connect(self.extract.set_status)
         w.log_updated.connect(self.log)
-        w.finished.connect(
+        w.extraction_finished.connect(
             lambda ok, msg, s=self.extract, k=key: self._on_finished(k, s, ok, msg)
         )
         self.workers[key] = w
